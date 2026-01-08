@@ -409,15 +409,11 @@ def segment_object():
         except ValueError:
             return jsonify({"error": "Coordinates must be valid numbers"}), 400
 
-        device = request.args.get("device", None)
         visualize = request.args.get("visualize", "true").lower() in [
             "true",
             "1",
             "yes",
         ]
-
-        if device not in ["cpu", "cuda", "mps"]:
-            return jsonify({"error": "Device must be 'cpu', 'cuda', or 'mps'"}), 400
 
         # Create output directory with datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds
@@ -430,7 +426,7 @@ def segment_object():
         file.save(str(image_path))
 
         # Process image
-        result, best_mask, image = process_image(image_path, x, y, device)
+        result, best_mask, image = process_image(image_path, x, y, device=None)
 
         # Create visualizations (if requested)
         vis_filename = None
@@ -457,7 +453,6 @@ def segment_object():
             "timestamp": timestamp,
             "original_filename": filename,
             "saved_to": str(output_dir),
-            "device": device,
         }
 
         # Add visualization filenames if created
