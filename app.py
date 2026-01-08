@@ -20,6 +20,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 from werkzeug.utils import secure_filename
+import signal
+import time
 
 from flask import Flask, request, jsonify
 import torch
@@ -38,9 +40,15 @@ UPLOAD_FOLDER = Path("output")
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "heic", "heif"}
 CHECKPOINT = "./sam/checkpoints/sam2.1_hiera_large.pt"
 MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+REQUEST_TIMEOUT = 60  # 10 minutes in seconds
 
 # Global predictor (initialized on first request to save startup time)
 predictor = None
+
+
+def timeout_handler(signum, frame):
+    """Handle request timeout."""
+    raise TimeoutError("Request exceeded maximum processing time")
 
 
 def allowed_file(filename):
@@ -396,6 +404,14 @@ def segment_object():
                 400,
             )
 
+        # Set timeout alarm for Unix systems (Linux, macOS)
+        try:
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(REQUEST_TIMEOUT)
+        except (AttributeError, ValueError):
+            # Windows doesn't support signal.SIGALRM, skip timeout
+            pass
+
         # Get query parameters
         x = request.args.get("x")
         y = request.args.get("y")
@@ -466,6 +482,8 @@ def segment_object():
 
         return jsonify(result), 200
 
+    except TimeoutError as e:
+        return jsonify({"error": str(e)}), 408
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except FileNotFoundError as e:
@@ -480,6 +498,12 @@ def segment_object():
         )
     except Exception as e:
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+    finally:
+        # Disable timeout alarm
+        try:
+            signal.alarm(0)
+        except (AttributeError, ValueError):
+            pass
 
 
 @app.route("/api/health", methods=["GET"])
