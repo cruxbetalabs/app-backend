@@ -48,12 +48,12 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def init_predictor(device="mps"):
+def init_predictor(device=None):
     """
     Initialize the SAM2 predictor (lazy loading).
 
     Args:
-        device: Device to run inference on ('cpu', 'cuda', or 'mps')
+        device: Device to run inference on ('cpu', 'cuda', or 'mps'). If None, auto-selects.
 
     Returns:
         SAM2ImagePredictor: Initialized predictor
@@ -61,8 +61,16 @@ def init_predictor(device="mps"):
     global predictor
 
     if predictor is None:
-        # Determine device
-        if device == "mps" and not torch.backends.mps.is_available():
+        # Auto-select device if not specified
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        # Determine device with fallback
+        elif device == "mps" and not torch.backends.mps.is_available():
             device = "cpu"
         elif device == "cuda" and not torch.cuda.is_available():
             device = "cpu"
@@ -401,7 +409,7 @@ def segment_object():
         except ValueError:
             return jsonify({"error": "Coordinates must be valid numbers"}), 400
 
-        device = request.args.get("device", "mps")
+        device = request.args.get("device", None)
         visualize = request.args.get("visualize", "true").lower() in [
             "true",
             "1",
