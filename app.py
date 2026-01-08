@@ -53,7 +53,7 @@ def init_predictor(device=None):
     Initialize the SAM2 predictor (lazy loading).
 
     Args:
-        device: Device to run inference on ('cpu', 'cuda', or 'mps'). If None, auto-selects.
+        device: Device to run inference on. If None, auto-selects the best available.
 
     Returns:
         SAM2ImagePredictor: Initialized predictor
@@ -69,11 +69,6 @@ def init_predictor(device=None):
                 device = "mps"
             else:
                 device = "cpu"
-        # Determine device with fallback
-        elif device == "mps" and not torch.backends.mps.is_available():
-            device = "cpu"
-        elif device == "cuda" and not torch.cuda.is_available():
-            device = "cpu"
 
         torch_device = torch.device(device)
 
@@ -295,7 +290,7 @@ def create_polygon_debug_image(image, mask_data_list, point_coords, output_path)
     return output_path
 
 
-def process_image(image_path, x, y, device="mps"):
+def process_image(image_path, x, y, device=None):
     """
     Process an image and segment the object at the given point.
 
@@ -303,7 +298,7 @@ def process_image(image_path, x, y, device="mps"):
         image_path: Path to the image file
         x: X-coordinate of the point
         y: Y-coordinate of the point
-        device: Device to run inference on
+        device: Device to run inference on (None for auto-detection)
 
     Returns:
         tuple: (result dict, best_mask, image) - Segmentation results, best mask, and original image
@@ -317,6 +312,15 @@ def process_image(image_path, x, y, device="mps"):
         raise ValueError(
             f"Coordinates ({x}, {y}) are out of bounds for image size ({width}, {height})"
         )
+
+    # Determine device for autocast
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     # Initialize predictor
     pred = init_predictor(device)
@@ -367,7 +371,6 @@ def segment_object():
     Query parameters:
         - x: float (required) - X coordinate of the point
         - y: float (required) - Y coordinate of the point
-        - device: str (default 'mps') - 'cpu', 'cuda', or 'mps'
         - visualize: bool (default true) - whether to create visualization images
 
     Returns:
@@ -512,7 +515,6 @@ def index():
                         "query_params": {
                             "x": "float (required) - X coordinate of the point",
                             "y": "float (required) - Y coordinate of the point",
-                            "device": "str ('cpu', 'cuda', or 'mps', default 'mps')",
                             "visualize": "bool (true/false, default true) - create visualization images",
                         },
                         "returns": "JSON with segmentation masks and polygon data",
