@@ -40,7 +40,7 @@ UPLOAD_FOLDER = Path("output")
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "heic", "heif"}
 CHECKPOINT = "./sam/checkpoints/sam2.1_hiera_large.pt"
 MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-REQUEST_TIMEOUT = 60  # 10 minutes in seconds
+REQUEST_TIMEOUT = 60  # 1 minute in seconds
 
 # Global predictor (initialized on first request to save startup time)
 predictor = None
