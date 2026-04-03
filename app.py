@@ -21,13 +21,13 @@ from datetime import datetime
 from pathlib import Path
 from werkzeug.utils import secure_filename
 import signal
-import time
+from time import perf_counter
 
 from flask import Flask, request, jsonify
 import torch
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -37,13 +37,37 @@ app = Flask(__name__)
 
 # Configuration
 UPLOAD_FOLDER = Path("output")
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "heic", "heif"}
-CHECKPOINT = "./sam/checkpoints/sam2.1_hiera_large.pt"
-MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+ALLOWED_EXTENSIONS = {
+    "png",
+    "jpg",
+    "jpeg",
+    "heic",
+    "heif",
+    "webp",
+    "gif",
+    "tiff",
+    "avif",
+}
+CHECKPOINT = "./sam/checkpoints/sam2.1_hiera_small.pt"
+MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_s.yaml"
 REQUEST_TIMEOUT = 60  # 1 minute in seconds
 
 # Global predictor (initialized on first request to save startup time)
 predictor = None
+
+
+def get_inference_device(device=None):
+    """Resolve the device used for inference."""
+    if device is not None:
+        return device
+
+    if torch.cuda.is_available():
+        return "cuda"
+
+    if torch.backends.mps.is_available():
+        return "mps"
+
+    return "cpu"
 
 
 def timeout_handler(signum, frame):
@@ -70,13 +94,7 @@ def init_predictor(device=None):
 
     if predictor is None:
         # Auto-select device if not specified
-        if device is None:
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
+        device = get_inference_device(device)
 
         torch_device = torch.device(device)
 
@@ -85,6 +103,17 @@ def init_predictor(device=None):
         predictor = SAM2ImagePredictor(sam2_model)
 
     return predictor
+
+
+def load_image_for_segmentation(image_path):
+    """Load an image with orientation normalization for model inference."""
+    with Image.open(str(image_path)) as image_file:
+        normalized_image = ImageOps.exif_transpose(image_file)
+
+        if normalized_image.mode != "RGB":
+            normalized_image = normalized_image.convert("RGB")
+
+        return np.array(normalized_image)
 
 
 def extract_polygon_from_mask(mask):
@@ -311,8 +340,13 @@ def process_image(image_path, x, y, device=None):
     Returns:
         tuple: (result dict, best_mask, image) - Segmentation results, best mask, and original image
     """
-    # Load image
-    image = np.array(Image.open(str(image_path)).convert("RGB"))
+    timings = {}
+
+    total_start = perf_counter()
+
+    load_start = perf_counter()
+    image = load_image_for_segmentation(image_path)
+    timings["image_load_ms"] = round((perf_counter() - load_start) * 1000, 2)
 
     # Validate coordinates
     height, width = image.shape[:2]
@@ -321,27 +355,30 @@ def process_image(image_path, x, y, device=None):
             f"Coordinates ({x}, {y}) are out of bounds for image size ({width}, {height})"
         )
 
-    # Determine device for autocast
-    if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+    device = get_inference_device(device)
 
     # Initialize predictor
+    predictor_init_start = perf_counter()
     pred = init_predictor(device)
+    timings["predictor_init_ms"] = round(
+        (perf_counter() - predictor_init_start) * 1000, 2
+    )
 
     # Run inference
+    inference_start = perf_counter()
     with torch.inference_mode(), torch.autocast(device, dtype=torch.bfloat16):
+        set_image_start = perf_counter()
         pred.set_image(image)
+        timings["set_image_ms"] = round((perf_counter() - set_image_start) * 1000, 2)
 
+        predict_start = perf_counter()
         masks, scores, logits = pred.predict(
             point_coords=np.array([[x, y]]),
             point_labels=np.array([1]),  # 1 = foreground point
             multimask_output=True,
         )
+        timings["predict_ms"] = round((perf_counter() - predict_start) * 1000, 2)
+    timings["inference_total_ms"] = round((perf_counter() - inference_start) * 1000, 2)
 
     # Sort masks by score in descending order
     sorted_indices = np.argsort(scores)[::-1]
@@ -349,11 +386,14 @@ def process_image(image_path, x, y, device=None):
     scores = scores[sorted_indices]
 
     # Extract data for all masks
+    mask_extract_start = perf_counter()
     masks_data = []
     for mask, score in zip(masks, scores):
         mask_data = extract_mask_data(mask, score, image.shape[:2])
         if mask_data:
             masks_data.append(mask_data)
+    timings["mask_extract_ms"] = round((perf_counter() - mask_extract_start) * 1000, 2)
+    timings["total_process_ms"] = round((perf_counter() - total_start) * 1000, 2)
 
     result = {
         "point": {"x": float(x), "y": float(y)},
@@ -361,6 +401,10 @@ def process_image(image_path, x, y, device=None):
         "summary": {
             "total_masks": len(masks_data),
             "best_score": float(scores[0]) if len(scores) > 0 else 0.0,
+        },
+        "performance": {
+            "device": device,
+            "timings_ms": timings,
         },
     }
 
@@ -450,6 +494,7 @@ def segment_object():
         # Create visualizations (if requested)
         vis_filename = None
         debug_filename = None
+        visualization_start = perf_counter()
 
         if visualize and best_mask is not None:
             # Create main visualization with best mask
@@ -461,6 +506,10 @@ def segment_object():
             debug_filename = f"{Path(filename).stem}_debug_polygons.jpg"
             debug_path = output_dir / debug_filename
             create_polygon_debug_image(image, result["masks"], [x, y], debug_path)
+
+        result["performance"]["timings_ms"]["visualization_ms"] = round(
+            (perf_counter() - visualization_start) * 1000, 2
+        )
 
         # Save JSON result
         json_path = output_dir / "segmentation_result.json"
@@ -484,6 +533,8 @@ def segment_object():
 
     except TimeoutError as e:
         return jsonify({"error": str(e)}), 408
+    except UnidentifiedImageError:
+        return jsonify({"error": "Unsupported or unreadable image file"}), 400
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except FileNotFoundError as e:
@@ -506,6 +557,126 @@ def segment_object():
             pass
 
 
+@app.route("/api/segment/batch", methods=["POST"])
+def segment_batch():
+    """
+    Batch segmentation endpoint. Encodes the image once, then runs predict()
+    for each supplied point independently — one mask per point.
+
+    Accepts multipart/form-data with an 'image' field.
+    Query parameter:
+        - points: JSON array of [x, y] pairs, e.g. [[100,200],[300,400]]
+
+    Returns:
+        JSON: { "results": [ { "point": {"x": …, "y": …}, "masks": […] }, … ] }
+        Each entry with out-of-bounds coordinates gets an empty masks array and
+        an "error" key explaining why.
+    """
+    try:
+        if "image" not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+
+        file = request.files["image"]
+
+        if file.filename == "":
+            return jsonify({"error": "No image file selected"}), 400
+
+        if not allowed_file(file.filename):
+            return (
+                jsonify(
+                    {
+                        "error": f"Invalid file type. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"
+                    }
+                ),
+                400,
+            )
+
+        points_param = request.args.get("points")
+        if not points_param:
+            return (
+                jsonify(
+                    {
+                        "error": "'points' query param is required (JSON array of [x, y] pairs)"
+                    }
+                ),
+                400,
+            )
+
+        try:
+            raw_points = json.loads(points_param)
+            if not isinstance(raw_points, list) or len(raw_points) == 0:
+                raise ValueError("Points must be a non-empty array")
+            points = [[float(p[0]), float(p[1])] for p in raw_points]
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            return jsonify({"error": f"Invalid 'points' format: {exc}"}), 400
+
+        # Save uploaded file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        output_dir = UPLOAD_FOLDER / timestamp
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = secure_filename(file.filename)
+        image_path = output_dir / filename
+        file.save(str(image_path))
+
+        # Load image once
+        image = load_image_for_segmentation(image_path)
+        height, width = image.shape[:2]
+
+        device = get_inference_device()
+        pred = init_predictor(device)
+
+        results = []
+        with torch.inference_mode(), torch.autocast(device, dtype=torch.bfloat16):
+            # Encode the image a single time — this is the expensive step
+            pred.set_image(image)
+
+            for x, y in points:
+                if not (0 <= x < width and 0 <= y < height):
+                    results.append(
+                        {
+                            "point": {"x": float(x), "y": float(y)},
+                            "masks": [],
+                            "error": (
+                                f"Coordinates ({x}, {y}) are out of bounds "
+                                f"for image size ({width}, {height})"
+                            ),
+                        }
+                    )
+                    continue
+
+                masks, scores, _ = pred.predict(
+                    point_coords=np.array([[x, y]]),
+                    point_labels=np.array([1]),  # 1 = foreground point
+                    multimask_output=True,
+                )
+
+                sorted_indices = np.argsort(scores)[::-1]
+                masks = masks[sorted_indices]
+                scores = scores[sorted_indices]
+
+                masks_data = []
+                for mask, score in zip(masks, scores):
+                    mask_data = extract_mask_data(mask, score, image.shape[:2])
+                    if mask_data:
+                        masks_data.append(mask_data)
+
+                results.append(
+                    {
+                        "point": {"x": float(x), "y": float(y)},
+                        "masks": masks_data,
+                    }
+                )
+
+        return jsonify({"results": results}), 200
+
+    except UnidentifiedImageError:
+        return jsonify({"error": "Unsupported or unreadable image file"}), 400
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
     """Health check endpoint."""
@@ -517,6 +688,7 @@ def health_check():
                 "timestamp": datetime.now().isoformat(),
                 "model": "SAM2 (Segment Anything Model 2)",
                 "checkpoint": CHECKPOINT,
+                "device": get_inference_device(),
             }
         ),
         200,
@@ -558,6 +730,8 @@ def index():
 if __name__ == "__main__":
     # Ensure output directory exists
     UPLOAD_FOLDER.mkdir(exist_ok=True)
+
+    print(f"Model config path: {Path(MODEL_CONFIG).resolve()}")
 
     # Check if model checkpoint exists
     if not Path(CHECKPOINT).exists():
